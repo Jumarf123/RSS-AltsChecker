@@ -5,7 +5,4 @@
 
 **RSS-AltsChecker** >> **Redlotus Alts Checker**
 
-# TODO:
-
-1) Добавить базу данных с MyTiers 
 
