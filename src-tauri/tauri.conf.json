@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "RSS-AltsChecker",
+  "version": "1.0.0",
+  "identifier": "com.rss.altschecker",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "RSS-AltsChecker",
+        "width": 1160,
+        "height": 780,
+        "minWidth": 860,
+        "minHeight": 600,
+        "decorations": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "publisher": "Jumarf",
+    "copyright": "Copyright (c) 2026 Jumarf",
+    "shortDescription": "RSS-AltsChecker",
+    "longDescription": "RSS-AltsChecker by Jumarf",
+    "icon": ["rss.ico"],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": false
+      }
+    }
+  }
+}
