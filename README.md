@@ -1,8 +1,17 @@
-# RSS-AltsChecker
+# Rss-AltsChecker
+
+/ Добавлен Steam Alts Check  /
+/ Улучшен дизайн /
+/ Исправлены баги связанные с discord alts /
+/ Добавил confidence /
 
 
-**RSS-AltsChecker** - Это детектор alts аккаунтов discord + minecraft
+**Наш дискорд где дружное коммьюнити:**
 
-**RSS-AltsChecker** >> **Redlotus Alts Checker**
+https://discord.gg/residencescreenshare
+
+## recode 28.02.2026
+
+## Редизайн + крупное обновление 31.06.2026 
 
 
