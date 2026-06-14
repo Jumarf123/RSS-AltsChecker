@@ -7,7 +7,7 @@
 4) Добавил confidence 
 
 
-**Наш дискорд где дружное коммьюнити:**
+**дискорд:**
 
 https://discord.gg/residencescreenshare
 
