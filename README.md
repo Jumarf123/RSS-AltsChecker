@@ -1,18 +1,23 @@
-# Rss-AltsChecker
+# AltsChecker
 
 **Что нового в обновлении?**
+new:
+1) анализ памяти процессов
+2) Поиск alt accounts внутри процессов
+
+
+old:
 1) Добавлен Steam Alts Check
 2) Улучшен дизайн 
 3) Исправлены баги связанные с discord alts 
 4) Добавил confidence 
 
 
-**дискорд:**
-
-https://discord.gg/residencescreenshare
 
 ## recode 28.02.2026
 
 ## Редизайн + крупное обновление 31.06.2026 
+
+## Обновление discord alts check 24.10.2026
 
 
