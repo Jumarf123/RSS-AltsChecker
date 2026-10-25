@@ -128,12 +128,14 @@ struct WalPhysicalRecord {
     record_type: WalRecordType,
     payload: Vec<u8>,
     checksum_ok: bool,
+    follows_gap: bool,
 }
 
 #[derive(Debug)]
 struct WalPhysicalParseResult {
     records: Vec<WalPhysicalRecord>,
     warnings: Vec<String>,
+    trailing_gap: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -333,15 +335,12 @@ fn parse_text_log_file(path: &Path) -> Result<TextLogFile, String> {
 fn parse_wal_file(path: &Path) -> Result<WalFile, String> {
     let data =
         fs::read(path).map_err(|e| format!("Failed to read WAL file {}: {e}", path.display()))?;
+    Ok(parse_wal_bytes(&data))
+}
 
-    let physical = parse_wal_physical_records(&data);
-    if physical.records.is_empty() {
-        return Err(format!(
-            "No valid WAL physical records were found in {}.",
-            path.display()
-        ));
-    }
-    let logical = assemble_wal_logical_records(&physical.records);
+fn parse_wal_bytes(data: &[u8]) -> WalFile {
+    let physical = parse_wal_physical_records(data);
+    let logical = assemble_wal_logical_records(&physical);
 
     let mut batches = Vec::with_capacity(logical.records.len());
     for record in logical.records {
@@ -390,18 +389,19 @@ fn parse_wal_file(path: &Path) -> Result<WalFile, String> {
     let mut warnings = physical.warnings;
     warnings.extend(logical.warnings);
 
-    Ok(WalFile {
+    WalFile {
         physical_records: physical.records.len(),
         logical_records: batches.len(),
         warnings,
         batches,
-    })
+    }
 }
 
 fn parse_wal_physical_records(data: &[u8]) -> WalPhysicalParseResult {
     let mut records = Vec::new();
     let mut warnings = Vec::new();
     let mut offset = 0usize;
+    let mut follows_gap = false;
 
     while offset < data.len() {
         let block_offset = offset % WAL_BLOCK_SIZE;
@@ -425,8 +425,10 @@ fn parse_wal_physical_records(data: &[u8]) -> WalPhysicalParseResult {
         let length = u16::from_le_bytes([data[offset + 4], data[offset + 5]]) as usize;
         let record_type_byte = data[offset + 6];
 
-        if checksum == 0 && length == 0 && record_type_byte == 0 {
-            offset += WAL_HEADER_SIZE;
+        if length == 0 && record_type_byte == 0 {
+            // Preallocated padding ends this block, not the entire WAL.
+            offset += bytes_left_in_block;
+            follows_gap = true;
             continue;
         }
 
@@ -438,17 +440,28 @@ fn parse_wal_physical_records(data: &[u8]) -> WalPhysicalParseResult {
                 bytes_left_in_block - WAL_HEADER_SIZE
             ));
             offset += bytes_left_in_block;
+            follows_gap = true;
             continue;
         }
 
         let payload_start = offset + WAL_HEADER_SIZE;
         let payload_end = payload_start + length;
         if payload_end > data.len() {
-            warnings.push(format!(
-                "Truncated physical record at offset {} (declared {} byte payload).",
-                offset, length
-            ));
+            // A legal frame cut off at snapshot EOF is an unfinished write.
             break;
+        }
+
+        let payload = &data[payload_start..payload_end];
+        let checksum_ok = verify_wal_record_checksum(checksum, record_type_byte, payload);
+        if !checksum_ok {
+            warnings.push(format!(
+                "Checksum mismatch at offset {}: expected masked CRC {:08x}.",
+                offset, checksum
+            ));
+            // The length may be damaged too; only the next block is a safe boundary.
+            offset += bytes_left_in_block;
+            follows_gap = true;
+            continue;
         }
 
         let Some(record_type) = WalRecordType::from_byte(record_type_byte) else {
@@ -457,40 +470,48 @@ fn parse_wal_physical_records(data: &[u8]) -> WalPhysicalParseResult {
                 record_type_byte, offset
             ));
             offset = payload_end;
+            follows_gap = true;
             continue;
         };
-
-        let payload = data[payload_start..payload_end].to_vec();
-        let checksum_ok = verify_wal_record_checksum(checksum, record_type_byte, &payload);
-        if !checksum_ok {
-            warnings.push(format!(
-                "Checksum mismatch at offset {}: expected masked CRC {:08x}.",
-                offset, checksum
-            ));
-        }
 
         records.push(WalPhysicalRecord {
             offset,
             record_type,
-            payload,
+            payload: payload.to_vec(),
             checksum_ok,
+            follows_gap,
         });
 
+        follows_gap = false;
         offset = payload_end;
     }
 
-    WalPhysicalParseResult { records, warnings }
+    WalPhysicalParseResult {
+        records,
+        warnings,
+        trailing_gap: follows_gap,
+    }
 }
 
-fn assemble_wal_logical_records(physical_records: &[WalPhysicalRecord]) -> WalLogicalParseResult {
+fn assemble_wal_logical_records(physical: &WalPhysicalParseResult) -> WalLogicalParseResult {
     let mut logical_records = Vec::new();
     let mut warnings = Vec::new();
     let mut pending: Option<WalLogicalRecord> = None;
 
-    for record in physical_records {
+    for record in &physical.records {
+        if record.follows_gap {
+            if let Some(open) = pending.take().filter(|open| !open.payload.is_empty()) {
+                warnings.push(format!(
+                    "Discarded fragmented record from offset {} across a WAL gap.",
+                    open.offset
+                ));
+            }
+        }
+
+        // LevelDB tolerates an abandoned empty FIRST emitted at a block boundary.
         match record.record_type {
             WalRecordType::Full => {
-                if let Some(open) = pending.take() {
+                if let Some(open) = pending.take().filter(|open| !open.payload.is_empty()) {
                     warnings.push(format!(
                         "Unterminated fragmented record started at offset {}.",
                         open.offset
@@ -504,7 +525,7 @@ fn assemble_wal_logical_records(physical_records: &[WalPhysicalRecord]) -> WalLo
                 });
             }
             WalRecordType::First => {
-                if let Some(open) = pending.take() {
+                if let Some(open) = pending.take().filter(|open| !open.payload.is_empty()) {
                     warnings.push(format!(
                         "Discarded unterminated fragmented record started at offset {}.",
                         open.offset
@@ -545,11 +566,14 @@ fn assemble_wal_logical_records(physical_records: &[WalPhysicalRecord]) -> WalLo
         }
     }
 
-    if let Some(open) = pending {
-        warnings.push(format!(
-            "WAL ended while a fragmented record from offset {} was still open.",
-            open.offset
-        ));
+    // An open FIRST/MIDDLE at actual EOF is normal; a padding/corruption gap is not.
+    if physical.trailing_gap {
+        if let Some(open) = pending.filter(|open| !open.payload.is_empty()) {
+            warnings.push(format!(
+                "Discarded fragmented record from offset {} across a WAL gap.",
+                open.offset
+            ));
+        }
     }
 
     WalLogicalParseResult {
@@ -1199,28 +1223,12 @@ mod tests {
 
     #[test]
     fn logical_record_reassembly_for_fragments() {
-        let physical = vec![
-            WalPhysicalRecord {
-                offset: 0,
-                record_type: WalRecordType::First,
-                payload: b"abc".to_vec(),
-                checksum_ok: true,
-            },
-            WalPhysicalRecord {
-                offset: 16,
-                record_type: WalRecordType::Middle,
-                payload: b"def".to_vec(),
-                checksum_ok: true,
-            },
-            WalPhysicalRecord {
-                offset: 32,
-                record_type: WalRecordType::Last,
-                payload: b"ghi".to_vec(),
-                checksum_ok: true,
-            },
-        ];
-
+        let mut wal = wal_frame(WalRecordType::First, b"abc");
+        wal.extend(wal_frame(WalRecordType::Middle, b"def"));
+        wal.extend(wal_frame(WalRecordType::Last, b"ghi"));
+        let physical = parse_wal_physical_records(&wal);
         let logical = assemble_wal_logical_records(&physical);
+        assert!(physical.warnings.is_empty());
         assert!(logical.warnings.is_empty());
         assert_eq!(logical.records.len(), 1);
         assert_eq!(logical.records[0].payload, b"abcdefghi");
@@ -1230,21 +1238,358 @@ mod tests {
     #[test]
     fn physical_record_parse_full_record() {
         let payload = b"xyz".to_vec();
-        let record_type = WalRecordType::Full.as_byte();
-        let checksum = mask_crc32c(crc32c_with_leading_byte(record_type, &payload));
-
-        let mut wal = Vec::new();
-        wal.extend_from_slice(&checksum.to_le_bytes());
-        wal.extend_from_slice(&(payload.len() as u16).to_le_bytes());
-        wal.push(record_type);
-        wal.extend_from_slice(&payload);
-
+        let wal = wal_frame(WalRecordType::Full, &payload);
         let parsed = parse_wal_physical_records(&wal);
         assert!(parsed.warnings.is_empty());
         assert_eq!(parsed.records.len(), 1);
         assert_eq!(parsed.records[0].record_type, WalRecordType::Full);
         assert_eq!(parsed.records[0].payload, payload);
         assert!(parsed.records[0].checksum_ok);
+    }
+
+    #[test]
+    fn wal_empty_and_preallocated_snapshots_are_quiet() {
+        for length in [
+            0,
+            1,
+            6,
+            7,
+            8,
+            WAL_BLOCK_SIZE - 1,
+            WAL_BLOCK_SIZE,
+            WAL_BLOCK_SIZE + 1,
+            WAL_BLOCK_SIZE + 7,
+            2 * WAL_BLOCK_SIZE + 6,
+        ] {
+            let parsed = parse_wal_bytes(&vec![0; length]);
+            assert!(
+                parsed.warnings.is_empty(),
+                "{length}: {:?}",
+                parsed.warnings
+            );
+            assert_eq!(parsed.physical_records, 0);
+            assert_eq!(parsed.logical_records, 0);
+            assert!(parsed.batches.is_empty());
+        }
+    }
+
+    #[test]
+    fn wal_final_frame_prefixes_preserve_complete_records() {
+        let frame = wal_frame(WalRecordType::Full, &wal_put_batch(b"saved"));
+        for preceding in [Vec::new(), wal_frame(WalRecordType::Full, &[0; 12])] {
+            for end in 0..=frame.len() {
+                let mut wal = preceding.clone();
+                wal.extend_from_slice(&frame[..end]);
+                let parsed = parse_wal_bytes(&wal);
+                assert!(parsed.warnings.is_empty(), "{end}: {:?}", parsed.warnings);
+                assert_eq!(
+                    parsed.batches.len(),
+                    usize::from(!preceding.is_empty()) + usize::from(end == frame.len())
+                );
+                assert!(parsed.batches.iter().all(|batch| batch.checksum_ok
+                    && batch.parse_error.is_none()
+                    && batch.trailing_bytes == 0));
+            }
+        }
+    }
+
+    #[test]
+    fn wal_unfinished_final_fragments_are_quiet() {
+        let payload = wal_put_batch(b"unfinished");
+        for with_middle in [false, true] {
+            let mut wal = wal_frame(WalRecordType::Full, &wal_put_batch(b"saved"));
+            wal.extend(wal_frame(WalRecordType::First, &payload[..5]));
+            let split = if with_middle {
+                wal.extend(wal_frame(WalRecordType::Middle, &payload[5..10]));
+                10
+            } else {
+                5
+            };
+            let last = wal_frame(WalRecordType::Last, &payload[split..]);
+            for end in 0..=last.len() {
+                let mut snapshot = wal.clone();
+                snapshot.extend_from_slice(&last[..end]);
+                let parsed = parse_wal_bytes(&snapshot);
+                assert!(parsed.warnings.is_empty(), "{end}: {:?}", parsed.warnings);
+                assert_eq!(parsed.batches.len(), 1 + usize::from(end == last.len()));
+                assert_eq!(
+                    parsed.batches[0].operations[0].value.as_deref(),
+                    Some(&b"saved"[..])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wal_zero_padding_skips_only_the_current_block() {
+        let frame = wal_frame(WalRecordType::Full, &wal_put_batch(b"later block"));
+        for checksum in [0u32, 0x1234_5678] {
+            let mut wal = vec![0; WAL_BLOCK_SIZE];
+            wal[..4].copy_from_slice(&checksum.to_le_bytes());
+            // Even a plausible frame inside the padded remainder is not a record.
+            wal[WAL_HEADER_SIZE..WAL_HEADER_SIZE + frame.len()].copy_from_slice(&frame);
+            wal.extend_from_slice(&frame);
+            let parsed = parse_wal_bytes(&wal);
+            assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+            assert_eq!(parsed.physical_records, 1);
+            assert_eq!(parsed.batches.len(), 1);
+            assert_eq!(parsed.batches[0].offset, WAL_BLOCK_SIZE);
+            assert!(parsed.batches[0].parse_error.is_none());
+        }
+    }
+
+    #[test]
+    fn wal_empty_delete_and_zero_value_batches_are_valid() {
+        let mut delete = vec![0; 12];
+        delete[8..12].copy_from_slice(&1u32.to_le_bytes());
+        delete.push(0);
+        push_len_prefixed(&mut delete, b"\0");
+        let mut wal = Vec::new();
+        for payload in [
+            vec![0; 12],
+            delete,
+            wal_put_batch(b"\0\0\0"),
+            wal_put_batch(b""),
+        ] {
+            wal.extend(wal_frame(WalRecordType::Full, &payload));
+        }
+        let parsed = parse_wal_bytes(&wal);
+        assert!(parsed.warnings.is_empty());
+        assert_eq!(parsed.batches.len(), 4);
+        assert!(parsed.batches.iter().all(|batch| batch.checksum_ok
+            && batch.parse_error.is_none()
+            && batch.trailing_bytes == 0));
+        assert_eq!(parsed.batches[0].declared_count, Some(0));
+        assert!(parsed.batches[0].operations.is_empty());
+        let delete = &parsed.batches[1].operations[0];
+        assert_eq!(delete.kind, WalOperationKind::Delete);
+        assert_eq!(delete.key, b"\0");
+        assert!(delete.value.is_none());
+        for (batch, value) in parsed.batches[2..].iter().zip([&b"\0\0\0"[..], &b""[..]]) {
+            assert_eq!(batch.operations[0].kind, WalOperationKind::Put);
+            assert_eq!(batch.operations[0].value.as_deref(), Some(value));
+        }
+    }
+
+    #[test]
+    fn wal_block_boundaries_preserve_empty_first_and_middle_fragments() {
+        let payload = wal_put_batch(b"next");
+        let overhead = wal_put_batch(&vec![0; WAL_BLOCK_SIZE]).len() - WAL_BLOCK_SIZE;
+        for remaining in 0..=WAL_HEADER_SIZE + 1 {
+            let value_len = WAL_BLOCK_SIZE - WAL_HEADER_SIZE - remaining - overhead;
+            let filler = wal_put_batch(&vec![0; value_len]);
+            let mut wal = wal_frame(WalRecordType::Full, &filler);
+            assert_eq!(wal.len() + remaining, WAL_BLOCK_SIZE);
+            if remaining < WAL_HEADER_SIZE {
+                wal.resize(WAL_BLOCK_SIZE, 0);
+                wal.extend(wal_frame(WalRecordType::Full, &payload));
+            } else {
+                let split = remaining - WAL_HEADER_SIZE;
+                wal.extend(wal_frame(WalRecordType::First, &payload[..split]));
+                wal.extend(wal_frame(WalRecordType::Last, &payload[split..]));
+            }
+            let parsed = parse_wal_bytes(&wal);
+            assert!(
+                parsed.warnings.is_empty(),
+                "{remaining}: {:?}",
+                parsed.warnings
+            );
+            assert_eq!(parsed.batches.len(), 2);
+            assert!(parsed.batches.iter().all(|batch| batch.checksum_ok
+                && batch.parse_error.is_none()
+                && batch.trailing_bytes == 0));
+            assert_eq!(
+                parsed.batches[1].fragments,
+                if remaining < WAL_HEADER_SIZE { 1 } else { 2 }
+            );
+        }
+
+        let value = vec![0; 2 * WAL_BLOCK_SIZE];
+        let payload = wal_put_batch(&value);
+        let mut wal = Vec::new();
+        for (index, chunk) in payload.chunks(WAL_BLOCK_SIZE - WAL_HEADER_SIZE).enumerate() {
+            let kind = match index {
+                0 => WalRecordType::First,
+                1 => WalRecordType::Middle,
+                _ => WalRecordType::Last,
+            };
+            wal.extend(wal_frame(kind, chunk));
+        }
+        let parsed = parse_wal_bytes(&wal);
+        assert!(parsed.warnings.is_empty());
+        assert_eq!(parsed.batches.len(), 1);
+        assert_eq!(parsed.batches[0].fragments, 3);
+        assert_eq!(
+            parsed.batches[0].operations[0].value.as_deref(),
+            Some(value.as_slice())
+        );
+    }
+
+    #[test]
+    fn wal_fragment_interruptions_distinguish_empty_starts() {
+        let payload = wal_put_batch(b"valid");
+        for abandoned in [&b""[..], &b"partial"[..]] {
+            for next in [WalRecordType::Full, WalRecordType::First] {
+                let mut wal = wal_frame(WalRecordType::First, abandoned);
+                wal.extend(wal_frame(next, &payload));
+                if next == WalRecordType::First {
+                    wal.extend(wal_frame(WalRecordType::Last, &[]));
+                }
+                let parsed = parse_wal_bytes(&wal);
+                assert_eq!(parsed.batches.len(), 1);
+                assert_eq!(parsed.warnings.is_empty(), abandoned.is_empty());
+                assert!(parsed.batches[0].parse_error.is_none());
+            }
+        }
+        for orphan in [WalRecordType::Middle, WalRecordType::Last] {
+            let parsed = parse_wal_bytes(&wal_frame(orphan, &payload));
+            assert!(parsed.batches.is_empty());
+            assert!(parsed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("without FIRST")));
+        }
+    }
+
+    #[test]
+    fn wal_corruption_is_reported_with_block_safe_recovery() {
+        let valid = wal_frame(WalRecordType::Full, &wal_put_batch(b"retained"));
+        for (damaged, diagnostic, skips_block) in corrupt_wal_frames() {
+            let parsed = parse_wal_bytes(&damaged);
+            assert!(parsed.batches.is_empty());
+            assert!(parsed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(diagnostic)));
+
+            let mut wal = valid.clone();
+            wal.extend(damaged);
+            wal.extend_from_slice(&valid);
+            wal.resize(WAL_BLOCK_SIZE, 0);
+            wal.extend_from_slice(&valid);
+            let parsed = parse_wal_bytes(&wal);
+            assert!(parsed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(diagnostic)));
+            assert_eq!(parsed.batches.len(), if skips_block { 2 } else { 3 });
+            assert_eq!(parsed.batches[0].offset, 0);
+            assert_eq!(parsed.batches.last().unwrap().offset, WAL_BLOCK_SIZE);
+            assert!(parsed.batches.iter().all(|batch| batch.checksum_ok
+                && batch.parse_error.is_none()
+                && batch.trailing_bytes == 0));
+        }
+    }
+
+    #[test]
+    fn wal_rejected_regions_never_join_fragments() {
+        let payload = wal_put_batch(b"must not join");
+        for (gap, _, skips_block) in
+            corrupt_wal_frames()
+                .into_iter()
+                .chain([(vec![0; WAL_HEADER_SIZE], "padding", true)])
+        {
+            let mut wal = wal_frame(WalRecordType::First, &payload[..5]);
+            wal.extend(gap);
+            let interrupted = parse_wal_bytes(&wal);
+            assert!(interrupted.batches.is_empty());
+            assert!(!interrupted.warnings.is_empty());
+
+            if skips_block {
+                wal.resize(WAL_BLOCK_SIZE, 0);
+            }
+            wal.extend(wal_frame(WalRecordType::Last, &payload[5..]));
+            wal.extend(wal_frame(WalRecordType::Full, &wal_put_batch(b"safe")));
+            let parsed = parse_wal_bytes(&wal);
+            assert!(!parsed.warnings.is_empty());
+            assert_eq!(parsed.batches.len(), 1);
+            assert_eq!(
+                parsed.batches[0].operations[0].value.as_deref(),
+                Some(&b"safe"[..])
+            );
+        }
+    }
+
+    #[test]
+    fn wal_complete_malformed_batches_keep_diagnostics() {
+        let valid = wal_put_batch(b"value");
+        let mut bad_count = valid.clone();
+        bad_count[8..12].copy_from_slice(&2u32.to_le_bytes());
+        let mut unknown_tag = valid.clone();
+        unknown_tag[12] = 9;
+        let mut bad_varint = valid[..13].to_vec();
+        bad_varint.extend_from_slice(&[0x80; 5]);
+        let mut excessive_count = valid.clone();
+        excessive_count[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        let mut zero_count = valid.clone();
+        zero_count[8..12].copy_from_slice(&0u32.to_le_bytes());
+        for (payload, error, trailing_bytes) in [
+            (Vec::new(), Some("too short"), 0),
+            (vec![0; 11], Some("too short"), 0),
+            (bad_count, Some("before entry 2 tag"), 0),
+            (unknown_tag, Some("Unknown WriteBatch operation tag"), 0),
+            (bad_varint, Some("Invalid varint32"), 0),
+            (valid[..15].to_vec(), Some("Truncated key"), 0),
+            (
+                valid[..valid.len() - 1].to_vec(),
+                Some("Truncated value"),
+                0,
+            ),
+            (excessive_count, Some("unreasonably large"), 0),
+            (trailing, None, 1),
+            (zero_count, None, valid.len() - 12),
+        ] {
+            let parsed = parse_wal_bytes(&wal_frame(WalRecordType::Full, &payload));
+            assert!(parsed.warnings.is_empty());
+            assert_eq!(parsed.batches.len(), 1);
+            let batch = &parsed.batches[0];
+            assert!(batch.checksum_ok);
+            assert_eq!(batch.trailing_bytes, trailing_bytes);
+            if let Some(error) = error {
+                assert!(batch.parse_error.as_deref().unwrap().contains(error));
+                assert!(batch.operations.is_empty());
+            } else {
+                assert!(batch.parse_error.is_none());
+            }
+        }
+    }
+
+    fn wal_put_batch(value: &[u8]) -> Vec<u8> {
+        let mut payload = 7u64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(1);
+        push_len_prefixed(&mut payload, b"key");
+        push_len_prefixed(&mut payload, value);
+        payload
+    }
+
+    fn wal_frame(record_type: WalRecordType, payload: &[u8]) -> Vec<u8> {
+        let record_type = record_type.as_byte();
+        let checksum = mask_crc32c(crc32c_with_leading_byte(record_type, payload));
+        let mut wal = checksum.to_le_bytes().to_vec();
+        wal.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_le_bytes());
+        wal.push(record_type);
+        wal.extend_from_slice(payload);
+        wal
+    }
+
+    fn corrupt_wal_frames() -> [(Vec<u8>, &'static str, bool); 3] {
+        let frame = wal_frame(WalRecordType::Full, &[0; 12]);
+        let mut checksum = frame.clone();
+        checksum[0] ^= 1;
+        let mut record_type = frame.clone();
+        record_type[6] = 9;
+        let crc = mask_crc32c(crc32c_with_leading_byte(9, &record_type[WAL_HEADER_SIZE..]));
+        record_type[..4].copy_from_slice(&crc.to_le_bytes());
+        let mut length = frame;
+        length[4..6].copy_from_slice(&u16::MAX.to_le_bytes());
+        [
+            (checksum, "Checksum mismatch", true),
+            (record_type, "Unknown WAL record type", false),
+            (length, "invalid length", true),
+        ]
     }
 
     #[test]

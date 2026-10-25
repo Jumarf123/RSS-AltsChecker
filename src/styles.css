@@ -13,8 +13,7 @@
 
 body {
   margin: 0;
-  min-width: 860px;
-  min-height: 600px;
+  min-width: 320px;
   overflow: hidden;
 }
 
@@ -41,7 +40,9 @@ button {
   --scroll-thumb: #2d6c80;
   background: var(--bg);
   color: var(--text);
-  min-height: 100vh;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
 }
 
 .app.light {
@@ -66,8 +67,9 @@ button {
 .topbar {
   position: relative;
   height: 64px;
+  flex-shrink: 0;
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr) 300px;
+  grid-template-columns: minmax(140px, 1fr) auto minmax(180px, 1fr);
   gap: 14px;
   align-items: center;
   padding: 0 14px;
@@ -82,42 +84,19 @@ button {
   z-index: 0;
 }
 
-.brand,
+.app-title,
 .topbar nav,
 .topbar-actions {
   position: relative;
   z-index: 1;
 }
 
-.brand {
-  display: inline-flex;
-  align-items: center;
-  width: 300px;
-  height: 48px;
-  border-radius: 12px;
-  padding: 5px 9px;
-  background: color-mix(in srgb, var(--surface-2) 82%, transparent);
-  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
-  text-decoration: none;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
-  overflow: hidden;
+.app-title {
+  font-size: 18px;
+  font-weight: 700;
+  pointer-events: none;
 }
 
-.brand:hover {
-  border-color: var(--accent-2);
-  background: var(--surface-3);
-}
-
-.brand img {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-  transform: none;
-  transform-origin: center;
-  filter: drop-shadow(0 6px 14px rgba(0, 0, 0, 0.28));
-}
-
-.app:not(.light) .brand img,
 .app:not(.light) .button-icon,
 .app:not(.light) .tab-icon,
 .app:not(.light) .service img {
@@ -164,6 +143,11 @@ button {
 button:hover {
   border-color: var(--accent-2);
   background: var(--surface-3);
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 
 button.active,
@@ -227,7 +211,8 @@ nav button.image-button img.tab-icon {
 }
 
 main {
-  height: calc(100vh - 64px);
+  flex: 1;
+  min-height: 0;
   overflow: auto;
   padding: 22px;
 }
@@ -289,13 +274,13 @@ main {
 }
 
 .home {
-  min-height: calc(100vh - 128px);
+  min-height: 100%;
   display: grid;
   place-items: center;
 }
 
 .home-card {
-  width: 420px;
+  width: min(420px, 100%);
   padding: 16px;
   border: 1px solid var(--border);
   border-radius: 14px;
@@ -329,6 +314,7 @@ main {
 
 .toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
   margin-bottom: 14px;
@@ -672,7 +658,7 @@ main {
 }
 
 .center-view {
-  min-height: calc(100vh - 140px);
+  min-height: 100%;
   display: grid;
   place-items: center;
 }
@@ -741,6 +727,8 @@ main {
 }
 
 .warning-list span {
+  max-width: 100%;
+  overflow-wrap: anywhere;
   color: var(--warning);
   border: 1px solid var(--warning);
   border-radius: 999px;
@@ -778,7 +766,7 @@ main {
 }
 
 .loader-card {
-  min-width: 340px;
+  width: min(440px, calc(100% - 32px));
   text-align: center;
   border: 1px solid var(--border);
   border-radius: 16px;
@@ -837,13 +825,20 @@ main {
 
 @media (max-width: 980px) {
   .topbar {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr) auto;
     height: auto;
+    gap: 8px;
     padding: 12px;
   }
 
-  .brand {
-    justify-self: center;
+  .topbar nav {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  .topbar-actions {
+    grid-column: 2;
+    grid-row: 1;
   }
 
   .home-actions,
@@ -861,10 +856,6 @@ main {
 
   nav button.image-button {
     width: min(100%, 168px);
-  }
-
-  main {
-    height: calc(100vh - 150px);
   }
 
   .steam-grid {

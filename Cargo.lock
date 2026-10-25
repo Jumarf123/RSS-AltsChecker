@@ -33,6 +33,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "altschecker"
+version = "1.1.0"
+dependencies = [
+ "bitflags 2.11.0",
+ "chrono",
+ "dirs 5.0.1",
+ "flate2",
+ "image",
+ "md5",
+ "once_cell",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-opener",
+ "ureq",
+ "walkdir",
+ "windows 0.58.0",
+ "winreg 0.52.0",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2830,30 +2854,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rss-altschecker"
-version = "1.0.0"
-dependencies = [
- "bitflags 2.11.0",
- "chrono",
- "dirs 5.0.1",
- "flate2",
- "image",
- "md5",
- "once_cell",
- "regex",
- "serde",
- "serde_json",
- "sha2",
- "tauri",
- "tauri-build",
- "tauri-plugin-opener",
- "ureq",
- "walkdir",
- "windows 0.58.0",
- "winreg 0.52.0",
 ]
 
 [[package]]

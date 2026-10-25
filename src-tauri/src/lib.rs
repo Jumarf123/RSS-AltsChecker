@@ -1,30 +1,36 @@
+mod discord_memory;
 mod scanner;
 mod usn_journal;
 #[allow(dead_code)]
 mod viewer;
 
 use scanner::{ScanOptions, ScanReport, SteamCheckReport, SystemHwid};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
 #[derive(Debug, Default)]
 struct AppState {
     event_log: Mutex<Vec<String>>,
+    alts_scan_active: AtomicBool,
 }
 
 #[tauri::command]
 async fn scan_alts(state: tauri::State<'_, AppState>) -> Result<ScanReport, String> {
+    if state.alts_scan_active.swap(true, Ordering::AcqRel) {
+        return Err("Alts Check уже выполняется".to_string());
+    }
     push_event(&state, "Запущен Alts Check");
-    let report = tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let options = ScanOptions {
             cancel_flag: Some(Arc::new(AtomicBool::new(false))),
             ..ScanOptions::default()
         };
         scanner::run_scan(&options)
     })
-    .await
-    .map_err(|error| error.to_string())??;
+    .await;
+    state.alts_scan_active.store(false, Ordering::Release);
+    let report = result.map_err(|error| error.to_string())??;
     push_event(
         &state,
         format!(
@@ -137,5 +143,5 @@ pub fn run() {
             window_close
         ])
         .run(tauri::generate_context!())
-        .expect("error while running RSS-AltsChecker");
+        .expect("error while running AltsChecker");
 }

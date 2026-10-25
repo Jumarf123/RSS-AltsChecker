@@ -60,15 +60,28 @@ type AuditReport = {
 };
 
 type ScanReport = {
+  generated_at: string;
   minecraft_accounts: MinecraftAlt[];
   discord_accounts: DiscordAlt[];
   steam_accounts: SteamAlt[];
   forensic_signals: string[];
   warnings: string[];
   audit: AuditReport;
+  stats: {
+    discord_processes_found: number;
+    discord_processes_scanned: number;
+    discord_memory_bytes_scanned: number;
+    discord_memory_bytes_unreadable: number;
+    discord_memory_read_failures: number;
+    discord_memory_states_found: number;
+    discord_memory_accounts_found: number;
+    discord_memory_incomplete: boolean;
+    discord_launched: boolean;
+  };
 };
 
 type SteamCheckReport = {
+  generated_at: string;
   steam_accounts: SteamAlt[];
   forensic_signals: string[];
   scanned_locations: string[];
@@ -137,11 +150,23 @@ function App() {
   const fallbackForCommand = (command: string) => {
     if (command === "scan_alts") {
       return {
+        generated_at: new Date().toISOString(),
         minecraft_accounts: [],
         discord_accounts: [],
         steam_accounts: [],
         forensic_signals: [],
-        warnings: [],
+        warnings: ["Проверка памяти доступна только в приложении AltsChecker, не в браузере."],
+        stats: {
+          discord_processes_found: 0,
+          discord_processes_scanned: 0,
+          discord_memory_bytes_scanned: 0,
+          discord_memory_bytes_unreadable: 0,
+          discord_memory_read_failures: 0,
+          discord_memory_states_found: 0,
+          discord_memory_accounts_found: 0,
+          discord_memory_incomplete: true,
+          discord_launched: false,
+        },
         audit: {
           signals: [],
           registry_path: null,
@@ -152,6 +177,7 @@ function App() {
     }
     if (command === "scan_steam") {
       return {
+        generated_at: new Date().toISOString(),
         steam_accounts: [],
         forensic_signals: [],
         scanned_locations: [],
@@ -184,6 +210,7 @@ function App() {
   };
 
   const runCommand = async <T,>(kind: LoadingKind, tab: Tab, command: string) => {
+    if (loading) return null;
     setActiveTab(tab);
     const tauriInvoke = (window as TauriWindow).__TAURI_INTERNALS__?.invoke;
     if (!tauriInvoke) {
@@ -196,7 +223,7 @@ function App() {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setError(message);
-      throw err;
+      return null;
     } finally {
       setLoading(null);
     }
@@ -204,17 +231,17 @@ function App() {
 
   const scanAlts = async () => {
     const report = await runCommand<ScanReport>("alts", "alts", "scan_alts");
-    setAltsReport(report);
+    if (report) setAltsReport(report);
   };
 
   const scanSteam = async () => {
     const report = await runCommand<SteamCheckReport>("steam", "steam", "scan_steam");
-    setSteamReport(report);
+    if (report) setSteamReport(report);
   };
 
   const getHwid = async () => {
     const value = await runCommand<SystemHwid>("hwid", "hwid", "get_hwid");
-    setHwid(value);
+    if (value) setHwid(value);
   };
 
   const openExternal = async (url: string) => {
@@ -273,17 +300,7 @@ function App() {
     <div className={`app ${theme}`}>
       <header className="topbar">
         <div className="titlebar-drag-region" data-tauri-drag-region aria-hidden="true" />
-        <a
-          className="brand"
-          href="https://discord.gg/residencescreenshare"
-          onClick={(event) => {
-            event.preventDefault();
-            void openExternal("https://discord.gg/residencescreenshare");
-          }}
-          aria-label="RSS-AltsChecker Discord"
-        >
-          <img src={asset("logotip.png")} alt="RSS-AltsChecker" />
-        </a>
+        <span className="app-title">AltsChecker</span>
         <nav>
           {tabs.map((tab) => (
             <button
@@ -353,6 +370,7 @@ function App() {
         )}
         {activeTab === "steam" && (
           <SteamView
+            key={steamReport?.generated_at ?? altsReport?.generated_at}
             accounts={steamAccounts}
             scanSteam={scanSteam}
             copy={copy}
@@ -363,7 +381,11 @@ function App() {
         {activeTab === "hwid" && <HwidView hwid={hwid} getHwid={getHwid} copy={copy} />}
       </main>
 
-      {loading && <LoadingOverlay label={loading === "steam" ? "Steam Check" : loading === "alts" ? "Alts Check" : "HWID Check"} />}
+      {loading && (
+        <LoadingOverlay
+          label={loading === "steam" ? "Steam Check" : loading === "alts" ? "Alts Check" : "HWID Check"}
+        />
+      )}
       {toast && <div className="toast">{toast}</div>}
     </div>
   );
@@ -414,10 +436,15 @@ function AltsView({
         <button className="primary action-button" onClick={scanAlts}>
           Alts Check
         </button>
-        <button onClick={() => copy(discordBulkText, "Discord скопирован")}>
+        <button disabled={!discordBulkText} onClick={() => copy(discordBulkText, "Discord скопирован")}>
           Copy Discord
         </button>
       </div>
+      {report && report.warnings.length > 0 && (
+        <div className="warning-list" aria-label="Предупреждения проверки">
+          {report.warnings.map((warning) => <span key={warning}>{warning}</span>)}
+        </div>
+      )}
       {!report ? (
         <Empty title="Alts Check ещё не запускался" />
       ) : (
@@ -525,7 +552,7 @@ function SteamCard({
           aria-label="Open Steam profile"
           title="Open Steam profile"
         >
-          <Avatar url={account.avatar_url ?? undefined} />
+          <Avatar key={account.avatar_url} url={account.avatar_url ?? undefined} />
           <span className="open-corner" aria-hidden="true">↗</span>
         </button>
         <div className="steam-title">
@@ -747,13 +774,10 @@ function StatusTile({
 
 function Avatar({ url }: { url?: string }) {
   const [failed, setFailed] = useState(false);
-  const highQualityUrl = url
-    ?.replace("_medium.", "_full.")
-    .replace("_medium/", "_full/");
-  if (!highQualityUrl || failed) {
+  if (!url || failed) {
     return <div className="avatar fallback">?</div>;
   }
-  return <img className="avatar" src={highQualityUrl} alt="Steam avatar" onError={() => setFailed(true)} />;
+  return <img className="avatar" src={url} alt="Steam avatar" onError={() => setFailed(true)} />;
 }
 
 function Empty({ title }: { title: string }) {

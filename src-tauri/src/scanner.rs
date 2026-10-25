@@ -18,10 +18,11 @@ use walkdir::{DirEntry, WalkDir};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+use crate::discord_memory::{self, MemoryAccount};
 use crate::usn_journal;
 use crate::viewer::{self, ParsedFileContent};
 
-const APP_NAME: &str = "RSS-AltsChecker";
+const APP_NAME: &str = "AltsChecker";
 pub const SCAN_CANCELLED_MESSAGE: &str = "Сканирование остановлено пользователем";
 
 const MAX_MINECRAFT_LOG_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -35,7 +36,9 @@ const MINECRAFT_SCAN_MAX_DEPTH: usize = 10;
 const DISCOVERY_SCAN_MAX_DEPTH: usize = 5;
 const DISCOVERY_MAX_DIRS_PER_PROFILE: usize = 25_000;
 const STEAM_ID64_BASE: u64 = 76_561_197_960_265_728;
+// Preserve existing audit history across the product rename.
 const AUDIT_REGISTRY_PATH: &str = r"Software\RSS-AltsChecker";
+const AUDIT_DIRECTORY_NAME: &str = "RSS-AltsChecker";
 const AUDIT_VERSION: u32 = 1;
 
 const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
@@ -289,6 +292,15 @@ pub struct ScanStats {
     pub minecraft_json_files_scanned: usize,
     pub logs_directories_found: usize,
     pub discord_files_scanned: usize,
+    pub discord_processes_found: usize,
+    pub discord_processes_scanned: usize,
+    pub discord_memory_bytes_scanned: u64,
+    pub discord_memory_bytes_unreadable: u64,
+    pub discord_memory_read_failures: u64,
+    pub discord_memory_states_found: usize,
+    pub discord_memory_accounts_found: usize,
+    pub discord_memory_incomplete: bool,
+    pub discord_launched: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -540,13 +552,13 @@ pub fn default_discord_leveldb_path() -> PathBuf {
 pub fn default_report_path() -> PathBuf {
     env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
-        .join("RSS-AltsChecker-results.json")
+        .join("AltsChecker-results.json")
 }
 
 pub fn default_steam_report_path() -> PathBuf {
     env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
-        .join("RSS-AltsChecker-steam-results.json")
+        .join("AltsChecker-steam-results.json")
 }
 
 pub fn write_report(report: &ScanReport, path: &Path) -> Result<(), String> {
@@ -616,7 +628,12 @@ pub fn scan(options: &ScanOptions) -> Result<ScanReport, String> {
     forensic_signals.extend(audit.signals.iter().cloned());
 
     if discord_scan.accounts.is_empty() {
-        forensic_signals.push("Discord: аккаунты не обнаружены".to_string());
+        forensic_signals.push(if stats.discord_memory_incomplete {
+            "Discord: в прочитанных данных аккаунты не обнаружены; проверка памяти неполная"
+                .to_string()
+        } else {
+            "Discord: в прочитанных данных аккаунты не обнаружены".to_string()
+        });
     }
     if minecraft_scan.accounts.is_empty() {
         forensic_signals.push("Minecraft: аккаунты не обнаружены".to_string());
@@ -628,6 +645,14 @@ pub fn scan(options: &ScanOptions) -> Result<ScanReport, String> {
     );
 
     let mut scanned_locations = Vec::<String>::new();
+    scanned_locations.push(format!(
+        "discord_memory: {}/{} processes, {} bytes, {} states; private + mapped; UTF-8 + UTF-16LE; incomplete={}",
+        stats.discord_processes_scanned,
+        stats.discord_processes_found,
+        stats.discord_memory_bytes_scanned,
+        stats.discord_memory_states_found,
+        stats.discord_memory_incomplete,
+    ));
     scanned_locations.extend(
         minecraft_roots
             .iter()
@@ -1611,6 +1636,19 @@ fn scan_discord_accounts(
     let mut scanned_dirs = Vec::<PathBuf>::new();
     let mut scanned_context_files = Vec::<PathBuf>::new();
 
+    let memory = discord_memory::scan(&|| check_cancelled(options).is_err());
+    check_cancelled(options)?;
+    stats.discord_processes_found = memory.processes_found;
+    stats.discord_processes_scanned = memory.processes_scanned;
+    stats.discord_memory_bytes_scanned = memory.bytes_scanned;
+    stats.discord_memory_bytes_unreadable = memory.bytes_unreadable;
+    stats.discord_memory_read_failures = memory.read_failures;
+    stats.discord_memory_states_found = memory.states_found;
+    stats.discord_memory_accounts_found = memory.accounts.len();
+    stats.discord_memory_incomplete = memory.incomplete;
+    stats.discord_launched = memory.launched_discord;
+    warnings.extend(memory.warnings);
+
     for leveldb_dir in leveldb_dirs {
         check_cancelled(options)?;
 
@@ -1665,6 +1703,8 @@ fn scan_discord_accounts(
         extract_discord_accounts_from_context_bytes(&bytes, &source, &mut map);
     }
 
+    merge_discord_memory_accounts(&mut map, &memory.accounts);
+
     let mut out = Vec::<DiscordAlt>::new();
     let mut profile_accounts = HashMap::<String, BTreeSet<String>>::new();
 
@@ -1674,7 +1714,7 @@ fn scan_discord_accounts(
         };
 
         let confidence = classify_discord_candidate(&entry);
-        let username = if entry.username == "unknown" {
+        let username = if entry.username == "unknown" && entry.named_hits == 0 {
             format!("id:{id}")
         } else {
             entry.username.clone()
@@ -1708,6 +1748,33 @@ fn scan_discord_accounts(
         scanned_dirs,
         scanned_context_files,
     })
+}
+
+fn merge_discord_memory_accounts(
+    map: &mut HashMap<String, DiscordCandidate>,
+    accounts: &[MemoryAccount],
+) {
+    for account in accounts {
+        let entry = map
+            .entry(format!("id:{}", account.id))
+            .or_insert_with(|| DiscordCandidate {
+                username: account.username.clone(),
+                id: Some(account.id.clone()),
+                sources: BTreeSet::new(),
+                profile_keys: BTreeSet::new(),
+                evidence_hits: 0,
+                named_hits: 0,
+                owner_store_hits: 0,
+                context_hits: 0,
+                token_hits: 0,
+            });
+        // This input is already validated switcher state, not generic text or tokens.
+        entry.username = account.username.clone();
+        entry.evidence_hits += 1;
+        entry.named_hits += 1;
+        entry.owner_store_hits += 1;
+        entry.sources.extend(account.sources.iter().cloned());
+    }
 }
 
 fn scan_single_discord_leveldb_dir(
@@ -1755,27 +1822,7 @@ fn scan_single_discord_leveldb_dir(
                         }
                     }
                     ParsedFileContent::Wal(wal) => {
-                        for batch in wal.batches {
-                            for operation in batch.operations {
-                                if !is_discord_owner_store_key(&operation.key) {
-                                    continue;
-                                }
-                                extract_discord_accounts_from_bytes(
-                                    &operation.key,
-                                    &source,
-                                    map,
-                                    DiscordEvidenceKind::OwnerStore,
-                                );
-                                if let Some(value) = operation.value {
-                                    extract_discord_accounts_from_bytes(
-                                        &value,
-                                        &source,
-                                        map,
-                                        DiscordEvidenceKind::OwnerStore,
-                                    );
-                                }
-                            }
-                        }
+                        consume_discord_wal(wal, &source, map, warnings);
                     }
                     ParsedFileContent::TextLog(log) => {
                         let text = log.lines.join("\n");
@@ -1851,6 +1898,61 @@ fn scan_single_discord_leveldb_dir(
     }
 
     Ok(())
+}
+
+fn consume_discord_wal(
+    wal: viewer::WalFile,
+    source: &str,
+    map: &mut HashMap<String, DiscordCandidate>,
+    warnings: &mut Vec<String>,
+) {
+    for warning in wal.warnings {
+        warnings.push(format!("Discord WAL warning in {source}: {warning}"));
+    }
+
+    for batch in wal.batches {
+        if !batch.checksum_ok {
+            warnings.push(format!(
+                "Discord WAL warning in {source} at offset {}: WriteBatch checksum mismatch.",
+                batch.offset
+            ));
+        }
+        if let Some(error) = &batch.parse_error {
+            warnings.push(format!(
+                "Discord WAL parse error in {source} at offset {}: {error}",
+                batch.offset
+            ));
+        }
+        if batch.trailing_bytes != 0 {
+            warnings.push(format!(
+                "Discord WAL warning in {source} at offset {}: WriteBatch has {} trailing bytes after its declared operations.",
+                batch.offset, batch.trailing_bytes
+            ));
+        }
+        if !batch.checksum_ok || batch.parse_error.is_some() || batch.trailing_bytes != 0 {
+            continue;
+        }
+
+        for operation in batch.operations {
+            if !is_discord_owner_store_key(&operation.key) {
+                continue;
+            }
+            extract_discord_accounts_from_bytes(
+                &operation.key,
+                source,
+                map,
+                DiscordEvidenceKind::OwnerStore,
+            );
+            if let Some(value) = operation.value {
+                extract_discord_accounts_from_bytes(
+                    &value,
+                    source,
+                    map,
+                    DiscordEvidenceKind::OwnerStore,
+                );
+            }
+        }
+    }
 }
 
 fn extract_discord_accounts_from_bytes(
@@ -2110,7 +2212,10 @@ fn is_foreign_discord_user_key(key: &str) -> bool {
 }
 
 fn is_foreign_context_near_position(text_lower: &str, pos: usize) -> bool {
-    let start = pos.saturating_sub(260);
+    let mut start = pos.saturating_sub(260);
+    while !text_lower.is_char_boundary(start) {
+        start += 1;
+    }
     let prefix = &text_lower[start..pos];
 
     let foreign_pos = [
@@ -3041,7 +3146,7 @@ fn insert_steam_candidate(
 pub fn build_third_party_checks(steam_id64: &str) -> Vec<ThirdPartyCheck> {
     let checked_at = Local::now().to_rfc3339();
     let bansearch_url = format!("https://bansearch.com/{steam_id64}");
-    let csgobans_url = format!("https://www.csgobans.com/?steamid={steam_id64}");
+    let csgobans_url = format!("https://vac-ban.com/profiles/{steam_id64}");
 
     vec![
         third_party_check(
@@ -3099,42 +3204,120 @@ fn enrich_steam_accounts(accounts: &mut [SteamAlt], warnings: &mut Vec<String>) 
 }
 
 fn enrich_steam_profiles_from_xml(accounts: &mut [SteamAlt], warnings: &mut Vec<String>) {
+    use std::io::Read as _;
+
     let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(4))
+        .timeout_connect(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(8))
         .build();
 
     for account in accounts.iter_mut() {
-        if account.persona_name.is_some() && account.avatar_url.is_some() {
-            continue;
+        let result = enrich_steam_profile(account, |url| {
+            let response = agent.get(url).call().map_err(|error| error.to_string())?;
+            // Avatar metadata is near the beginning of either response. Avoid
+            // downloading an unbounded profile page when falling back to HTML.
+            let mut bytes = Vec::new();
+            response
+                .into_reader()
+                .take(512 * 1024)
+                .read_to_end(&mut bytes)
+                .map_err(|error| error.to_string())?;
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        });
+        if let Err(error) = result {
+            warnings.push(format!(
+                "Steam profile avatar unavailable for {}: {error}",
+                account.steam_id64
+            ));
         }
+    }
+}
 
-        let url = format!(
-            "https://steamcommunity.com/profiles/{}?xml=1",
-            account.steam_id64
-        );
-        let response = match agent.get(&url).call() {
-            Ok(response) => response,
-            Err(_) => continue,
-        };
-        let text = match response.into_string() {
+fn enrich_steam_profile(
+    account: &mut SteamAlt,
+    mut fetch: impl FnMut(&str) -> Result<String, String>,
+) -> Result<(), String> {
+    if account.persona_name.is_some() && account.avatar_url.is_some() {
+        return Ok(());
+    }
+    let profile_url = format!("https://steamcommunity.com/profiles/{}", account.steam_id64);
+    let mut last_error = "response has no avatar URL".to_string();
+    // XML can be unavailable while the normal public profile still exposes
+    // og:image. Try that page once, without credentials or a third-party API.
+    for url in [format!("{profile_url}?xml=1"), profile_url] {
+        let text = match fetch(&url) {
             Ok(text) => text,
             Err(error) => {
-                warnings.push(format!(
-                    "Steam profile parse failed for {}: {error}",
-                    account.steam_id64
-                ));
+                last_error = error;
                 continue;
             }
         };
-
+        if extract_xml_tag(&text, "steamID64").is_some_and(|id| id != account.steam_id64) {
+            last_error = "response belongs to a different SteamID".to_string();
+            continue;
+        }
         if account.persona_name.is_none() {
             account.persona_name = extract_xml_tag(&text, "steamID");
         }
         if account.avatar_url.is_none() {
-            account.avatar_url = extract_xml_tag(&text, "avatarFull")
-                .or_else(|| extract_xml_tag(&text, "avatarMedium"));
+            account.avatar_url = extract_steam_avatar_url(&text);
+        }
+        if account.avatar_url.is_some() {
+            return Ok(());
+        }
+        last_error = "response has no avatar URL".to_string();
+    }
+    Err(last_error)
+}
+
+fn extract_steam_avatar_url(text: &str) -> Option<String> {
+    let avatar_url = |value: String| {
+        let value = value.trim().replace("&amp;", "&");
+        let value = if value.starts_with("//") {
+            format!("https:{value}")
+        } else {
+            value
+        };
+        let (host, path) = value.strip_prefix("https://")?.split_once('/')?;
+        let host = host.to_ascii_lowercase();
+        let steam_avatar_host = host == "avatars.steamstatic.com"
+            || (host.starts_with("avatars.") && host.ends_with(".steamstatic.com"))
+            || (host == "steamcdn-a.akamaihd.net"
+                && path.starts_with("steamcommunity/public/images/avatars/"));
+        (steam_avatar_host && !path.is_empty()).then_some(value)
+    };
+    if let Some(url) = ["avatarFull", "avatarMedium", "avatarIcon"]
+        .into_iter()
+        .filter_map(|tag| extract_xml_tag(text, tag))
+        .find_map(&avatar_url)
+    {
+        return Some(url);
+    }
+
+    static META_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?is)<meta\b[^>]*>").expect("regex must compile"));
+    static ATTRIBUTE_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"(?i)\s(property|name|content)\s*=\s*(?:"([^"]*)"|'([^']*)')"#)
+            .expect("regex must compile")
+    });
+    for meta in META_RE.find_iter(text) {
+        let mut is_avatar = false;
+        let mut content = None;
+        for attribute in ATTRIBUTE_RE.captures_iter(meta.as_str()) {
+            let value = attribute.get(2).or_else(|| attribute.get(3))?.as_str();
+            if attribute[1].eq_ignore_ascii_case("content") {
+                content = Some(value);
+            } else if value.eq_ignore_ascii_case("og:image") {
+                is_avatar = true;
+            }
+        }
+        if is_avatar {
+            if let Some(url) = content.and_then(|value| avatar_url(value.to_string())) {
+                return Some(url);
+            }
         }
     }
+    None
 }
 
 fn enrich_steam_bans(accounts: &mut [SteamAlt], warnings: &mut Vec<String>) {
@@ -3247,6 +3430,7 @@ fn extract_xml_tag(text: &str, tag: &str) -> Option<String> {
         value = value
             .trim_start_matches("<![CDATA[")
             .trim_end_matches("]]>")
+            .trim()
             .to_string();
     }
     if value.is_empty() {
@@ -3265,7 +3449,21 @@ fn persisted_record_from_discord(account: &DiscordAlt) -> PersistedAccountRecord
         .id
         .clone()
         .unwrap_or_else(|| account.username.clone());
-    persisted_record(&id, &account.username, &account.sources)
+    // PIDs and addresses change every run; keep bounded provenance in the audit.
+    let sources = account
+        .sources
+        .iter()
+        .map(|source| {
+            if classify_audit_source(source) == "volatile_memory" {
+                "memory://discord.exe".to_string()
+            } else {
+                source.clone()
+            }
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    persisted_record(&id, &account.username, &sources)
 }
 
 fn persisted_record_from_steam(account: &SteamAlt) -> PersistedAccountRecord {
@@ -3434,6 +3632,9 @@ fn missing_source_signals(label: &str, records: &[PersistedAccountRecord]) -> Ve
 }
 
 fn classify_audit_source(source: &str) -> &'static str {
+    if source.to_ascii_lowercase().starts_with("memory://") {
+        return "volatile_memory";
+    }
     let lower = source.replace('/', "\\").to_ascii_lowercase();
     if lower.contains("\\local storage\\leveldb\\")
         || lower.ends_with(".ldb")
@@ -3520,6 +3721,13 @@ fn compare_previous_records(
     previous
         .iter()
         .filter(|record| !current_ids.contains(&record.id.to_ascii_lowercase()))
+        // GC, a closed process or an unreadable page is not evidence of tampering.
+        .filter(|record| {
+            !record
+                .sources
+                .iter()
+                .any(|source| classify_audit_source(source) == "volatile_memory")
+        })
         .map(|record| {
             format!(
                 "DETECT: {label} account disappeared from current max scan but exists in audit: {} ({})",
@@ -3572,7 +3780,7 @@ fn audit_data_dir() -> PathBuf {
     dirs::data_local_dir()
         .or_else(|| env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(APP_NAME)
+        .join(AUDIT_DIRECTORY_NAME)
 }
 
 fn minecraft_audit_file() -> PathBuf {
@@ -4144,6 +4352,108 @@ mod tests {
     }
 
     #[test]
+    fn foreign_context_detector_handles_unicode_window_boundary() {
+        let text = format!(
+            "{}x\"author\":{{\"username\":\"example\"}}",
+            "\u{0436}".repeat(200)
+        );
+        let pos = text.find("\"username\"").unwrap();
+        assert!(!text.is_char_boundary(pos - 260));
+        assert!(is_foreign_context_near_position(&text, pos));
+    }
+
+    #[test]
+    fn discord_memory_merges_by_id_without_losing_unicode_or_file_evidence() {
+        let mut map = HashMap::new();
+        let file_source =
+            r"C:\Users\example\AppData\Roaming\discord\Local Storage\leveldb\000001.ldb";
+        insert_discord_candidate(
+            &mut map,
+            Some("old_name"),
+            Some("698025508365008949"),
+            file_source,
+            DiscordEvidenceKind::Context,
+        );
+        let memory = vec![
+            MemoryAccount {
+                id: "698025508365008949".to_string(),
+                username: "\u{0438}\u{043c}\u{044f}_\u{1f680}".to_string(),
+                sources: vec!["memory://discord.exe/pid/123/0x1000".to_string()],
+            },
+            MemoryAccount {
+                id: "698025508365008949".to_string(),
+                username: "\u{0438}\u{043c}\u{044f}_\u{1f680}".to_string(),
+                sources: vec!["memory://discord.exe/pid/456/0x2000".to_string()],
+            },
+        ];
+        merge_discord_memory_accounts(&mut map, &memory);
+        assert_eq!(map.len(), 1);
+        let entry = &map["id:698025508365008949"];
+        assert_eq!(entry.username, memory[0].username);
+        assert_eq!(entry.sources.len(), 3);
+        assert!(entry.sources.contains(file_source));
+        assert_eq!(entry.token_hits, 0);
+        assert_eq!(classify_discord_candidate(entry), ConfidenceLevel::Max);
+    }
+
+    #[test]
+    fn discord_memory_does_not_infer_windows_profile_links() {
+        let mut map = HashMap::new();
+        merge_discord_memory_accounts(
+            &mut map,
+            &[MemoryAccount {
+                id: "698025508365008949".to_string(),
+                username: "example".to_string(),
+                sources: vec!["memory://discord.exe/pid/123/0x1000".to_string()],
+            }],
+        );
+        assert!(map["id:698025508365008949"].profile_keys.is_empty());
+    }
+
+    #[test]
+    fn memory_audit_sources_are_volatile_and_do_not_imply_tampering() {
+        let memory = persisted_record(
+            "698025508365008949",
+            "example",
+            &["memory://discord.exe/pid/123/0x1000".to_string()],
+        );
+        assert_eq!(memory.source_kinds, ["volatile_memory"]);
+        assert!(missing_source_signals("Discord", &[memory.clone()]).is_empty());
+        assert!(compare_previous_records("Discord", &[memory.clone()], &[]).is_empty());
+
+        let mut mixed = memory;
+        mixed.sources.push("browser-artifact".to_string());
+        assert!(compare_previous_records("Discord", &[mixed], &[]).is_empty());
+
+        let file_only = persisted_record("file-id", "file-account", &["file-source".to_string()]);
+        assert_eq!(
+            compare_previous_records("Discord", &[file_only], &[]).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn discord_audit_summarizes_memory_addresses_across_runs() {
+        let mut account = DiscordAlt {
+            username: "example".to_string(),
+            id: Some("698025508365008949".to_string()),
+            confidence: ConfidenceLevel::Max,
+            sources: (1..=32)
+                .map(|pid| format!("memory://discord.exe/pid/{pid}/0x1000"))
+                .collect(),
+        };
+        let first = persisted_record_from_discord(&account);
+        assert_eq!(first.sources, ["memory://discord.exe"]);
+        assert_eq!(first.source_kinds, ["volatile_memory"]);
+        assert_eq!(account.sources.len(), 32);
+
+        account.sources = vec!["memory://discord.exe/pid/999/0x9000".to_string()];
+        let merged =
+            merge_persisted_records(vec![first], vec![persisted_record_from_discord(&account)]);
+        assert_eq!(merged[0].sources, ["memory://discord.exe"]);
+    }
+
+    #[test]
     fn profile_key_extraction_from_windows_path() {
         let path = Path::new(r"C:\Users\jumarf\AppData\Roaming\.minecraft\launcher_accounts.json");
         assert_eq!(
@@ -4207,6 +4517,86 @@ mod tests {
     }
 
     #[test]
+    fn discord_wal_empty_and_corrupt_files_have_distinct_diagnostics() {
+        for diagnostic in [None, Some("Checksum mismatch at offset 0.")] {
+            let wal = viewer::WalFile {
+                physical_records: 0,
+                logical_records: 0,
+                warnings: diagnostic.into_iter().map(str::to_string).collect(),
+                batches: Vec::new(),
+            };
+            let mut map = HashMap::new();
+            let mut warnings = Vec::new();
+            consume_discord_wal(wal, "synthetic.log", &mut map, &mut warnings);
+            assert!(map.is_empty());
+            assert_eq!(warnings.len(), usize::from(diagnostic.is_some()));
+            if let Some(diagnostic) = diagnostic {
+                assert!(warnings[0].contains("synthetic.log"));
+                assert!(warnings[0].contains(diagnostic));
+            }
+        }
+    }
+
+    #[test]
+    fn discord_wal_rejects_invalid_batches_without_suppressing_good_evidence() {
+        let valid = viewer::WalBatch {
+            offset: 123,
+            payload_bytes: 96,
+            fragments: 1,
+            checksum_ok: true,
+            sequence: Some(1),
+            declared_count: Some(1),
+            trailing_bytes: 0,
+            parse_error: None,
+            operations: vec![viewer::WalOperation {
+                kind: viewer::WalOperationKind::Put,
+                key: b"MultiAccountStore".to_vec(),
+                value: Some(br#"{"id":"123456789012345678","username":"wal_user"}"#.to_vec()),
+            }],
+        };
+        for (checksum_ok, parse_error, trailing_bytes, diagnostic) in [
+            (true, None, 0, None),
+            (false, None, 0, Some("checksum mismatch")),
+            (
+                true,
+                Some("Malformed WriteBatch"),
+                0,
+                Some("Malformed WriteBatch"),
+            ),
+            (true, None, 3, Some("3 trailing bytes")),
+        ] {
+            let mut batch = valid.clone();
+            batch.checksum_ok = checksum_ok;
+            batch.parse_error = parse_error.map(str::to_string);
+            batch.trailing_bytes = trailing_bytes;
+            let wal = viewer::WalFile {
+                physical_records: 1,
+                logical_records: 1,
+                warnings: vec!["Earlier block corruption.".to_string()],
+                batches: vec![batch],
+            };
+            let mut map = HashMap::new();
+            let mut warnings = Vec::new();
+            consume_discord_wal(wal, "synthetic.log", &mut map, &mut warnings);
+            assert_eq!(warnings.len(), 1 + usize::from(diagnostic.is_some()));
+            assert!(warnings[0].contains("Earlier block corruption."));
+            assert!(warnings
+                .iter()
+                .all(|warning| warning.contains("synthetic.log")));
+            if let Some(diagnostic) = diagnostic {
+                assert!(map.is_empty());
+                assert!(warnings[1].contains("offset 123"));
+                assert!(warnings[1].contains(diagnostic));
+            } else {
+                assert_eq!(map.len(), 1);
+                let account = &map["id:123456789012345678"];
+                assert_eq!(account.username, "wal_user");
+                assert!(account.owner_store_hits > 0);
+            }
+        }
+    }
+
+    #[test]
     fn discord_context_profile_url_keeps_id_only_account() {
         let mut map = HashMap::<String, DiscordCandidate>::new();
         extract_discord_accounts_from_context_text(
@@ -4230,6 +4620,198 @@ mod tests {
             .get("id:1394584725926187069")
             .expect("must contain parsed id");
         assert_eq!(entry.username, "mini_pekka123123");
+    }
+
+    #[test]
+    fn csgobans_tile_opens_matching_vac_ban_profile() {
+        for id in ["76561199678669404", "76561198000000000"] {
+            let checks = build_third_party_checks(id);
+            assert_eq!(checks.len(), 2);
+            assert_eq!(checks[0].service, "CSGOBans");
+            assert_eq!(checks[0].url, format!("https://vac-ban.com/profiles/{id}"));
+            assert_eq!(checks[1].service, "BanSearch");
+            assert_eq!(checks[1].url, format!("https://bansearch.com/{id}"));
+        }
+    }
+
+    #[test]
+    #[ignore = "Requires ALTSCHECKER_STEAM_TEST_ID and public network access"]
+    fn steam_avatar_public_http_smoke() {
+        let id = std::env::var("ALTSCHECKER_STEAM_TEST_ID").expect("Provide a public SteamID64");
+        assert_eq!(normalize_steam_id(&id).as_deref(), Some(id.as_str()));
+        let mut accounts = [SteamAlt {
+            profile_url: format!("https://steamcommunity.com/profiles/{id}"),
+            steam_id64: id,
+            account_name: None,
+            persona_name: None,
+            avatar_url: None,
+            bans: SteamBanStatus::default(),
+            third_party: Vec::new(),
+            confidence: ConfidenceLevel::Low,
+            sources: Vec::new(),
+        }];
+        let mut warnings = Vec::new();
+        // Exercise only anonymous profile enrichment, never local discovery,
+        // audit persistence, account credentials or ban API requests.
+        enrich_steam_profiles_from_xml(&mut accounts, &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(accounts[0].avatar_url.is_some());
+
+        accounts[0].avatar_url = None;
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(8))
+            .build();
+        enrich_steam_profile(&mut accounts[0], |url| {
+            if url.ends_with("?xml=1") {
+                return Err("synthetic XML outage".to_string());
+            }
+            agent
+                .get(url)
+                .call()
+                .map_err(|error| error.to_string())?
+                .into_string()
+                .map_err(|error| error.to_string())
+        })
+        .expect("Public HTML fallback should provide the avatar");
+        assert!(accounts[0].avatar_url.is_some());
+    }
+
+    #[test]
+    fn steam_avatar_html_uses_only_steam_images_and_handles_attribute_order() {
+        let expected = "https://avatars.fastly.steamstatic.com/example_full.jpg";
+        for sample in [
+            format!(r#"<meta property="og:image" content="{expected}">"#),
+            format!("<META CONTENT='{expected}' PROPERTY='og:image'>"),
+            r#"<meta name="og:image" content="//avatars.fastly.steamstatic.com/example_full.jpg">"#
+                .to_string(),
+        ] {
+            assert_eq!(extract_steam_avatar_url(&sample).as_deref(), Some(expected));
+        }
+        for sample in [
+            r#"<meta property="og:image" content="https://example.com/avatar.jpg">"#,
+            r#"<meta property="og:image" content="https://avatars.fastly.steamstatic.com.evil.example/avatar.jpg">"#,
+            r#"<meta property="og:image" content="file:///avatar.jpg">"#,
+            r#"<meta data-property="og:image" content="https://avatars.fastly.steamstatic.com/example_full.jpg">"#,
+        ] {
+            assert!(extract_steam_avatar_url(sample).is_none());
+        }
+    }
+
+    #[test]
+    fn steam_avatar_profile_fallback_is_bounded_and_retains_valid_names() {
+        let profile = "https://steamcommunity.com/profiles/76561198000000000";
+        let avatar = "https://avatars.fastly.steamstatic.com/example_full.jpg";
+        let html = format!(r#"<meta property="og:image" content="{avatar}">"#);
+        let xml = format!(
+            "<profile><steamID64>76561198000000000</steamID64><steamID>Example</steamID><avatarFull>{avatar}</avatarFull></profile>"
+        );
+        let template = SteamAlt {
+            steam_id64: "76561198000000000".to_string(),
+            account_name: None,
+            persona_name: None,
+            avatar_url: None,
+            profile_url: profile.to_string(),
+            bans: SteamBanStatus::default(),
+            third_party: Vec::new(),
+            confidence: ConfidenceLevel::Low,
+            sources: Vec::new(),
+        };
+        for first in [
+            Err("synthetic timeout".to_string()),
+            Ok("<profile><avatarFull><![CDATA[ ]]></avatarFull></profile>".to_string()),
+            Ok(xml.replace("76561198000000000", "76561198000000001")),
+        ] {
+            let mut account = template.clone();
+            let mut requests = Vec::new();
+            enrich_steam_profile(&mut account, |url| {
+                requests.push(url.to_string());
+                if requests.len() == 1 {
+                    first.clone()
+                } else {
+                    Ok(html.clone())
+                }
+            })
+            .unwrap();
+            assert_eq!(requests, [format!("{profile}?xml=1"), profile.to_string()]);
+            assert_eq!(account.avatar_url.as_deref(), Some(avatar));
+            assert!(account.persona_name.is_none());
+        }
+
+        let mut account = template.clone();
+        let mut calls = 0;
+        enrich_steam_profile(&mut account, |_| {
+            calls += 1;
+            Ok(xml.clone())
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(account.avatar_url.as_deref(), Some(avatar));
+        assert_eq!(account.persona_name.as_deref(), Some("Example"));
+
+        let mut account = template;
+        let mut calls = 0;
+        let result = enrich_steam_profile(&mut account, |_| {
+            calls += 1;
+            if calls == 1 {
+                Ok("<profile><steamID>Kept Name</steamID></profile>".to_string())
+            } else {
+                Err("synthetic offline".to_string())
+            }
+        });
+        assert_eq!(calls, 2);
+        assert_eq!(result, Err("synthetic offline".to_string()));
+        assert!(account.avatar_url.is_none());
+        assert_eq!(account.persona_name.as_deref(), Some("Kept Name"));
+    }
+
+    #[test]
+    fn steam_avatar_xml_prefers_supplied_full_url() {
+        let sample = r#"<profile>
+            <steamID64>76561198000000000</steamID64>
+            <avatarIcon>https://avatars.fastly.steamstatic.com/example.jpg</avatarIcon>
+            <avatarMedium>https://avatars.fastly.steamstatic.com/example_medium.jpg</avatarMedium>
+            <avatarFull><![CDATA[https://avatars.fastly.steamstatic.com/example_full.jpg]]></avatarFull>
+        </profile>"#;
+        assert_eq!(
+            extract_steam_avatar_url(sample).as_deref(),
+            Some("https://avatars.fastly.steamstatic.com/example_full.jpg")
+        );
+    }
+
+    #[test]
+    fn steam_avatar_xml_falls_back_without_rewriting_sizes() {
+        let sample = r#"<profile>
+            <avatarFull><![CDATA[   ]]></avatarFull>
+            <avatarMedium><![CDATA[
+                https://avatars.fastly.steamstatic.com/example_medium.jpg
+            ]]></avatarMedium>
+            <avatarIcon>https://avatars.fastly.steamstatic.com/example.jpg</avatarIcon>
+        </profile>"#;
+        assert_eq!(
+            extract_steam_avatar_url(sample).as_deref(),
+            Some("https://avatars.fastly.steamstatic.com/example_medium.jpg")
+        );
+    }
+
+    #[test]
+    fn steam_avatar_xml_uses_icon_or_returns_none() {
+        assert_eq!(
+            extract_steam_avatar_url(
+                "<profile><avatarFull></avatarFull><avatarMedium><![CDATA[]]></avatarMedium>\
+                 <avatarIcon>https://avatars.fastly.steamstatic.com/example.jpg</avatarIcon></profile>"
+            )
+            .as_deref(),
+            Some("https://avatars.fastly.steamstatic.com/example.jpg")
+        );
+        for sample in [
+            "",
+            "<profile><avatarFull><![CDATA[   ]]></avatarFull></profile>",
+            "<profile><avatarFull>truncated",
+            "<response><error>Unavailable</error></response>",
+            "<html><body>Service unavailable</body></html>",
+        ] {
+            assert_eq!(extract_steam_avatar_url(sample), None);
+        }
     }
 
     #[test]

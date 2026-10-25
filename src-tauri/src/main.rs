@@ -8,7 +8,7 @@ fn main() {
         }
     }
 
-    rss_altschecker_lib::run();
+    altschecker_lib::run();
 }
 
 #[cfg(target_os = "windows")]
@@ -95,10 +95,10 @@ mod webview2_guard {
     }
 
     fn show_install_prompt() -> bool {
-        let title = wide("RSS-AltsChecker");
+        let title = wide("AltsChecker");
         let instruction = wide("Microsoft Edge WebView2 Runtime не установлен");
         let content = wide(
-            "RSS-AltsChecker использует WebView2 для интерфейса. Нажмите «Установить», \
+            "AltsChecker использует WebView2 для интерфейса. Нажмите «Установить», \
              скачайте Evergreen Runtime с официального сайта Microsoft и после установки \
              запустите программу снова.",
         );
@@ -139,11 +139,11 @@ mod webview2_guard {
     }
 
     fn show_fallback_message_box() -> bool {
-        let title = wide("RSS-AltsChecker");
+        let title = wide("AltsChecker");
         let message = wide(
             "Microsoft Edge WebView2 Runtime не установлен.\n\n\
              Нажмите OK, чтобы открыть официальный сайт Microsoft для установки. \
-             После установки запустите RSS-AltsChecker снова.",
+             После установки запустите AltsChecker снова.",
         );
         let result = unsafe {
             MessageBoxW(

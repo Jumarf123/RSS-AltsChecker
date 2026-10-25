@@ -1,17 +1,17 @@
 [package]
-name = "rss-altschecker"
-version = "1.0.0"
-description = "RSS-AltsChecker"
+name = "altschecker"
+version = "1.1.0"
+description = "AltsChecker"
 authors = ["Jumarf"]
 edition = "2021"
 build = "build.rs"
 
 [lib]
-name = "rss_altschecker_lib"
+name = "altschecker_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
-name = "rss-altschecker"
+name = "AltsChecker"
 path = "src/main.rs"
 test = false
 bench = false
@@ -39,8 +39,15 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
     "Win32_UI_Controls",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
